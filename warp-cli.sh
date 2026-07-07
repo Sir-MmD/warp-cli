@@ -7,6 +7,9 @@ GOLD=$(tput setaf 3)
 CYAN=$(tput setaf 6)
 NC=$(tput sgr0)
 
+RPM_REPO_URL="https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo"
+RPM_REPO_FILE="/etc/yum.repos.d/cloudflare-warp.repo"
+
 root_check() {
   if [ "$(id -u)" -ne 0 ]; then
     echo "This script must be run as ${RED}root!${NC}"
@@ -14,13 +17,27 @@ root_check() {
   fi
 }
 
+# Detect the package manager and dispatch to the matching installer.
+# Order matters: check the most specific / official paths first.
 check_host() {
     if command -v apt &> /dev/null; then
         apt_based
+    elif command -v dnf &> /dev/null; then
+        rpm_based dnf
+    elif command -v microdnf &> /dev/null; then
+        rpm_based microdnf
     elif command -v yum &> /dev/null; then
-        yum_based
+        rpm_based yum
+    elif command -v zypper &> /dev/null; then
+        zypper_based
+    elif command -v pacman &> /dev/null; then
+        pacman_based
+    elif command -v rpm &> /dev/null; then
+        echo "${RED}RPM-based system detected but no supported installer (dnf/microdnf/yum) found.${NC}"
+        echo "Install 'dnf' or 'yum', then re-run this script."
+        exit 1
     else
-        echo "${RED}Package manager (apt/yum) not supported${NC}"
+        echo "${RED}No supported package manager found (apt/dnf/yum/zypper/pacman).${NC}"
         exit 1
     fi
 }
@@ -29,25 +46,89 @@ apt_based() {
     echo "${CYAN}Running apt-based installation...${NC}"
     apt update
     apt install -y curl gpg lsb-release apt-transport-https ca-certificates sudo
-    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflare-client.list
     apt update
     apt -y install cloudflare-warp
 }
 
-yum_based() {
-    echo "${CYAN}Running yum-based installation...${NC}"
-    curl -fsSl https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo | sudo tee /etc/yum.repos.d/cloudflare-warp.repo
-    yum check-update
-    yum install -y curl sudo coreutils
-    yum check-update
-    yum install -y cloudflare-warp
+# Shared installer for RPM-based systems (dnf / microdnf / yum).
+# Cloudflare ships a single .rpm repo that all three consume.
+rpm_based() {
+    local mgr="$1"
+    echo "${CYAN}Running ${mgr}-based installation...${NC}"
+    mkdir -p /etc/yum.repos.d
+
+    # RHEL / CentOS / Rocky / AlmaLinux need EPEL for cloudflare-warp's
+    # dependencies. Fedora does NOT (and must not enable it). Best-effort.
+    local id=""
+    [ -r /etc/os-release ] && id="$(. /etc/os-release; echo "$ID")"
+    if [ "$id" != "fedora" ]; then
+        echo "${CYAN}Enabling EPEL (required on RHEL-family)...${NC}"
+        "$mgr" install -y epel-release 2> /dev/null || true
+    fi
+
+    curl -fsSl "$RPM_REPO_URL" | tee "$RPM_REPO_FILE" > /dev/null
+    "$mgr" install -y curl || true
+    "$mgr" install -y cloudflare-warp
+}
+
+# openSUSE / SUSE. Unofficial: Cloudflare provides no zypper repo,
+# but the RPM repo works when added manually. Best-effort.
+zypper_based() {
+    echo "${CYAN}Running zypper-based installation (unofficial)...${NC}"
+    zypper --non-interactive removerepo cloudflare-warp &> /dev/null
+    zypper --non-interactive addrepo -f -G "$RPM_REPO_URL" cloudflare-warp
+    zypper --non-interactive --gpg-auto-import-keys refresh
+    zypper --non-interactive install cloudflare-warp
+}
+
+# Arch Linux. Cloudflare ships no official package; the community AUR
+# package 'cloudflare-warp-bin' repackages the .deb. makepkg refuses to
+# run as root, so build it via an AUR helper as the invoking user.
+pacman_based() {
+    echo "${CYAN}Running pacman-based installation (Arch / AUR)...${NC}"
+
+    local builder="${SUDO_USER:-}"
+    if [ -z "$builder" ] || [ "$builder" = "root" ]; then
+        echo "${RED}Arch install needs a non-root user to build the AUR package.${NC}"
+        echo "Re-run with sudo from a normal user account, e.g.:"
+        echo "  ${GOLD}sudo bash warp-cli.sh${NC}"
+        exit 1
+    fi
+
+    pacman -Sy --needed --noconfirm base-devel git sudo
+
+    local helper=""
+    if command -v yay &> /dev/null; then
+        helper="yay"
+    elif command -v paru &> /dev/null; then
+        helper="paru"
+    else
+        echo "${RED}No AUR helper (yay/paru) found.${NC}"
+        echo "Install one first, e.g. 'yay', then re-run this script."
+        exit 1
+    fi
+
+    echo "${CYAN}Building cloudflare-warp-bin via ${helper} as user '${builder}'...${NC}"
+    sudo -u "$builder" "$helper" -S --needed --noconfirm cloudflare-warp-bin
+
+    echo "${CYAN}Enabling WARP service...${NC}"
+    systemctl enable --now warp-svc &> /dev/null || true
 }
 
 warp_setup() {
     if ! command -v warp-cli &> /dev/null; then
         echo "${RED}WARP-CLI command not found after installation!${NC}"
         exit 1
+    fi
+
+    local port
+    read -p "Enter SOCKS5 proxy port [${GOLD}10808${NC}]: " port
+    port="${port:-10808}"
+    if ! [[ "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo "${RED}Invalid port '${port}'. Falling back to 10808.${NC}"
+        port=10808
     fi
 
     echo "${CYAN}Configuring WARP... (Waiting 2s for service to start)${NC}"
@@ -64,7 +145,7 @@ warp_setup() {
         exit 1
     fi
 
-    if ! warp-cli proxy port 10808; then
+    if ! warp-cli proxy port "$port"; then
         echo "${RED}Failed to set WARP proxy port.${NC}"
         exit 1
     fi
@@ -75,7 +156,7 @@ warp_setup() {
     fi
 
     echo ""
-    echo "${CYAN}WARP is ready! ${GOLD}SOCKS5 port: 10808${NC}"
+    echo "${CYAN}WARP is ready! ${GOLD}SOCKS5 port: ${port}${NC}"
     echo ""
 }
 
@@ -87,35 +168,57 @@ apt_uninstall() {
     apt update
 }
 
-yum_uninstall() {
-    echo "Uninstalling for yum-based system..."
-    yum remove -y cloudflare-warp
-    rm -f /etc/yum.repos.d/cloudflare-warp.repo
+rpm_uninstall() {
+    local mgr="$1"
+    echo "Uninstalling for ${mgr}-based system..."
+    "$mgr" remove -y cloudflare-warp
+    rm -f "$RPM_REPO_FILE"
+}
+
+zypper_uninstall() {
+    echo "Uninstalling for zypper-based system..."
+    zypper --non-interactive remove cloudflare-warp
+    zypper --non-interactive removerepo cloudflare-warp &> /dev/null
+}
+
+pacman_uninstall() {
+    echo "Uninstalling for pacman-based system..."
+    pacman -Rns --noconfirm cloudflare-warp-bin
 }
 
 uninstall_warp() {
     echo "${RED}Uninstalling Cloudflare WARP...${NC}"
-    
-    
+
+
     if command -v warp-cli &> /dev/null; then
         echo "Disconnecting and unregistering..."
         warp-cli disconnect &> /dev/null
         warp-cli registration delete &> /dev/null
     fi
-    
-    
+
+
     if command -v systemctl &> /dev/null; then
         systemctl stop cloudflare-warp &> /dev/null
         systemctl disable cloudflare-warp &> /dev/null
+        systemctl stop warp-svc &> /dev/null
+        systemctl disable warp-svc &> /dev/null
     fi
 
-    
+
     if command -v apt &> /dev/null; then
         apt_uninstall
+    elif command -v dnf &> /dev/null; then
+        rpm_uninstall dnf
+    elif command -v microdnf &> /dev/null; then
+        rpm_uninstall microdnf
     elif command -v yum &> /dev/null; then
-        yum_uninstall
+        rpm_uninstall yum
+    elif command -v zypper &> /dev/null; then
+        zypper_uninstall
+    elif command -v pacman &> /dev/null; then
+        pacman_uninstall
     else
-        echo "${RED}Package manager (apt/yum) not supported. Cannot uninstall.${NC}"
+        echo "${RED}No supported package manager found. Cannot uninstall.${NC}"
         echo "Please remove 'cloudflare-warp' manually."
         exit 1
     fi
@@ -142,7 +245,7 @@ fi
 root_check
 
 if command -v warp-cli &> /dev/null; then
-    
+
     echo "${CYAN}WARP-CLI is already installed.${NC}"
     echo ""
     echo "What would you like to do?"
