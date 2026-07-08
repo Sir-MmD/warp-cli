@@ -200,8 +200,8 @@ uninstall_warp() {
     if command -v systemctl &> /dev/null; then
         systemctl stop cloudflare-warp &> /dev/null
         systemctl disable cloudflare-warp &> /dev/null
-        systemctl stop warp-svc &> /dev/null
-        systemctl disable warp-svc &> /dev/null
+        systemctl stop warp-svc.service &> /dev/null
+        systemctl disable warp-svc.service &> /dev/null
     fi
 
 
