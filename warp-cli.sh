@@ -70,7 +70,63 @@ rpm_based() {
 
     curl -fsSl "$RPM_REPO_URL" | tee "$RPM_REPO_FILE" > /dev/null
     "$mgr" install -y curl || true
-    "$mgr" install -y cloudflare-warp
+
+    if ! "$mgr" install -y cloudflare-warp; then
+        echo "${GOLD}Standard install failed.${NC}"
+        # RHEL 10 / CentOS Stream 10 dropped libdbusmenu, so cloudflare-warp's
+        # GUI-only dependency (libappindicator-gtk3) can't be satisfied. The
+        # CLI (warp-cli) and daemon (warp-svc) don't need the tray icon, so
+        # retry a CLI-only install that skips just that dependency.
+        rpm_cli_only_install "$mgr"
+    fi
+}
+
+# Fallback for RHEL-family releases where cloudflare-warp's GUI dependency
+# (libappindicator-gtk3 -> libdbusmenu) is unsatisfiable. Downloads the RPM
+# and installs it without dependency checks so warp-cli / warp-svc still work.
+rpm_cli_only_install() {
+    local mgr="$1"
+    echo "${CYAN}Retrying CLI-only install (skipping the GUI tray dependency)...${NC}"
+
+    local tmpdir rpmfile arch
+    tmpdir="$(mktemp -d)"
+    arch="$(uname -m)"   # the repo carries both x86_64 and aarch64 RPMs
+
+    # `dnf download` only fetches the named package (no dependency resolution),
+    # so it succeeds even though a dependency is broken. Provided by
+    # dnf-plugins-core (dnf) / yum-utils (yum). Restrict to this machine's arch.
+    if command -v dnf &> /dev/null; then
+        dnf install -y 'dnf-command(download)' &> /dev/null \
+            || dnf install -y dnf-plugins-core &> /dev/null || true
+        dnf download --arch "$arch" --destdir "$tmpdir" cloudflare-warp
+    elif command -v yumdownloader &> /dev/null || yum install -y yum-utils &> /dev/null; then
+        yumdownloader --archlist "$arch" --destdir "$tmpdir" cloudflare-warp
+    else
+        echo "${RED}Could not download the RPM (need dnf or yum-utils).${NC}"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    # Pick the RPM matching this machine's arch, in case both were fetched.
+    rpmfile="$(ls "$tmpdir"/cloudflare-warp*."$arch".rpm 2> /dev/null | head -n1)"
+    if [ -z "$rpmfile" ]; then
+        echo "${RED}Failed to download the cloudflare-warp RPM.${NC}"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    # --nodeps skips only the unsatisfiable GUI dependency; the package's
+    # scriptlets still run and set up the warp-svc systemd unit.
+    rpm -Uvh --nodeps "$rpmfile"
+    local rc=$?
+    rm -rf "$tmpdir"
+
+    # A fresh nodeps install may not auto-start the daemon; warp_setup needs it.
+    if command -v systemctl &> /dev/null; then
+        systemctl enable --now warp-svc.service &> /dev/null || true
+    fi
+
+    return $rc
 }
 
 # openSUSE / SUSE. Unofficial: Cloudflare provides no zypper repo,

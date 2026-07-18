@@ -19,6 +19,14 @@ This is a simple script to install the Cloudflare WARP Linux Client (warp-cli). 
 > `cloudflare-warp` dependencies. The script auto-runs `dnf install epel-release`
 > (skipped on Fedora). On genuine RHEL you may still need to enable EPEL manually
 > per Red Hat's instructions. Fedora needs no EPEL.
+>
+> **RHEL 10 / CentOS Stream 10:** these releases dropped `libdbusmenu`, so
+> `cloudflare-warp`'s GUI-only dependency `libappindicator-gtk3` can't be
+> installed and a normal `dnf install` fails. When that happens the script
+> automatically retries a **CLI-only install** — it downloads the RPM and
+> installs it with `rpm --nodeps`, skipping just the tray-icon dependency that
+> `warp-cli` / `warp-svc` don't need. (Because of this, `dnf` may later warn
+> about the unmet GUI dependency; that's expected and doesn't affect the CLI.)
 
 > **Arch note:** Cloudflare ships no official Arch package. The script builds the AUR
 > package `cloudflare-warp-bin`, which requires an AUR helper (`yay` or `paru`) already
